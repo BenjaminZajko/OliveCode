@@ -91,30 +91,69 @@ def _effective_memory_gb(profile: HardwareProfile) -> float:
     """How much memory can a model actually use on this machine, with the
     OS / runtime overhead already subtracted.
 
+    Three regimes:
+
+      1. Apple Silicon (unified memory): the entire system RAM is the model
+         pool, minus OS/runtime headroom. Apple Silicon is genuinely good at
+         this; we use a small fixed headroom.
+
+      2. Dedicated NVIDIA/AMD GPU present: we treat the pool as VRAM plus a
+         generous slice of system RAM. llama.cpp routinely runs models that
+         spill beyond VRAM by offloading most layers to the GPU and a
+         handful to the CPU — that's a normal, supported config, not a
+         footgun. So the pool is roughly: (VRAM - small VRAM headroom) +
+         (system RAM - OS headroom), where the system-RAM slice is capped
+         to avoid recommending something the user can't actually run while
+         their IDE + browser are open.
+
+      3. CPU-only: system RAM minus a sensible headroom. The 50% cap keeps
+         us honest on machines with a lot of RAM (don't tell someone with
+         128 GB they can run a 100 GB model — that's still gonna swap).
+
     Returns -1.0 when we have no useful information about the host (no RAM
     detected and no GPU detected). Callers should treat that as "fall back
     to the smallest model" rather than a zero-sized pool.
     """
-    if profile.is_apple_silicon:
-        pool = profile.ram_total_gb or 0.0
-    elif profile.best_dedicated_vram_gb > 0:
-        pool = profile.best_dedicated_vram_gb
-    else:
-        pool = profile.ram_total_gb or 0.0
-
-    if pool <= 0:
-        return -1.0  # signal: we have no idea
+    ram = profile.ram_total_gb or 0.0
+    vram = profile.best_dedicated_vram_gb
 
     os_key = "apple_silicon" if profile.is_apple_silicon else (
-        profile.os_name.lower() if profile.os_name else "unknown"
+        (profile.os_name or "unknown").lower()
     )
     absolute_headroom = RAM_HEADROOM_GB.get(os_key, RAM_HEADROOM_GB["unknown"])
-    # Cap headroom at 50% of the pool, with a 2 GB floor. On tiny machines
-    # (e.g. 4 GB total) we still leave room for the model — the user just
-    # has to close everything else. On huge machines the cap prevents
-    # absurdly generous headroom.
-    headroom = max(2.0, min(absolute_headroom, pool * 0.5))
-    return max(0.0, pool - headroom)
+
+    if profile.is_apple_silicon:
+        # Unified memory: whole RAM minus a small headroom.
+        headroom = max(2.0, min(absolute_headroom, ram * 0.5))
+        pool = max(0.0, ram - headroom)
+        return pool if pool > 0 else -1.0
+
+    if vram > 0 and ram > 0:
+        # Dedicated-GPU box: VRAM (for the GPU-resident layers) plus a
+        # generous slice of system RAM (for offloaded CPU layers).
+        vram_usable = max(0.0, vram - VRAM_HEADROOM_GB)
+        # Allow up to 70% of system RAM to participate in offload. The OS
+        # + dev tools usually sit comfortably in the remaining 30% even
+        # while a 20 GB model is loading.
+        ram_usable = max(0.0, ram - max(2.0, absolute_headroom))
+        ram_offload_allowance = ram_usable * 0.70
+        pool = vram_usable + ram_offload_allowance
+        return pool
+
+    if vram > 0:
+        # GPU present but no RAM detected: fall back to VRAM alone, with
+        # a small headroom. This shouldn't happen in practice but we
+        # don't want to crash.
+        return max(0.0, vram - VRAM_HEADROOM_GB)
+
+    if ram > 0:
+        # CPU-only: keep the 50% cap so we don't recommend 100 GB on a
+        # 128 GB box.
+        headroom = max(2.0, min(absolute_headroom, ram * 0.5))
+        pool = max(0.0, ram - headroom)
+        return pool if pool > 0 else -1.0
+
+    return -1.0  # no useful info
 
 
 def _model_memory_need_gb(model: ModelEntry) -> float:
@@ -203,12 +242,21 @@ def _score_local(
 
     # 2. Speed
     speed = model.speed_score
-    if profile.best_dedicated_vram_gb >= 8:
-        # Real GPU: bump perceived speed a little.
+    vram = profile.best_dedicated_vram_gb
+    model_fits_in_vram = (vram > 0) and (need <= vram * 0.85)
+    if vram >= 8 and model_fits_in_vram:
+        # Real GPU, model fits in VRAM: bump perceived speed a little.
         speed = min(10.0, speed + 0.5)
         if model.needs_dedicated_gpu in ("yes", "sometimes"):
             reasons.append("Your dedicated GPU will give it a meaningful speed boost.")
-    elif profile.best_dedicated_vram_gb > 0:
+    elif vram >= 8 and not model_fits_in_vram:
+        # Real GPU but the model is bigger than VRAM — partial CPU offload.
+        speed = max(0.0, speed - 1.5)
+        reasons.append(
+            "Your GPU is real but smaller than this model; llama.cpp will offload some "
+            "layers to your CPU. Still much faster than CPU-only, but slower than a fully GPU-resident run."
+        )
+    elif vram > 0:
         if model.needs_dedicated_gpu == "yes":
             speed = max(0.0, speed - 2.0)
             reasons.append("Your GPU is small for this model; CPU offload will slow it down.")
