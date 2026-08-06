@@ -192,12 +192,14 @@ def _viable(profile: HardwareProfile, model: ModelEntry, pool_gb: float) -> bool
     """A model is viable if it fits in the usable memory pool with at
     least a small margin. We allow 'squeezed' but not 'too-big'.
 
-    If pool_gb is -1 (we don't know the host), we treat the *smallest*
-    models in the catalog as viable and skip the rest, so the worst case
-    is "the recommender can't find a comfortable pick and falls back to
-    the smallest model" rather than recommending a 70B model on a 4 GB
-    box.
+    Special case: server_class models (e.g. Qwen3-Coder-480B, DeepSeek
+    V4 Pro) require multi-GPU / huge unified memory. They are only viable
+    if the effective memory pool is at least 150 GB, regardless of fit
+    classification. This keeps us from quietly recommending something
+    that won't actually load on a consumer machine.
     """
+    if model.server_class:
+        return pool_gb >= 150.0
     if pool_gb < 0:
         # Unknown host: only trust models <= 4 GB of RAM need.
         return _model_memory_need_gb(model) <= 4.0

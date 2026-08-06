@@ -74,6 +74,7 @@ class ModelEntry:
     family: str                              # "llama", "qwen2.5-coder", "claude", "gemini", ...
     kind: str                                # "local" | "cloud"
     params_b: Optional[float]                # None for closed models we don't disclose
+    active_params_b: Optional[float] = None  # for MoE models: params active per token
     context_window: int
     # Resource requirements (for local models)
     ram_q4_gb: Optional[float] = None        # RAM footprint at Q4_K_M
@@ -87,13 +88,22 @@ class ModelEntry:
     # Notes
     best_for: str = ""
     watch_out: str = ""
+    # Catalog-management flags
+    server_class: bool = False               # requires multi-GPU / very large unified memory
+    flagship: bool = False                   # "best local, no compromises" tier for strong machines
+    license: str = "apache-2.0"              # informational; not a hard restriction
     # For cloud models
     free_tier: bool = True
     signup_required: bool = True
     notes: str = ""
 
     def estimated_ram_gb(self) -> float:
-        """Best-guess RAM footprint at this model's default quant."""
+        """Best-guess RAM footprint at this model's default quant.
+
+        For MoE models, the weights still all have to be loaded into memory
+        even if only a fraction of the params are active per token. So we
+        size on `params_b`, not `active_params_b`.
+        """
         if self.ram_q4_gb is not None and self.default_quant == DEFAULT_QUANT:
             return self.ram_q4_gb
         if self.params_b is None:
@@ -323,6 +333,127 @@ LOCAL_MODELS: list[ModelEntry] = [
         best_for="Classic code-completion model; still works for simple fills.",
         watch_out="Pre-dates modern agent-style prompting. Newer Qwen2.5-Coder beats it.",
     ),
+
+    # ---------- Qwen3-Coder family (2026 flagship) ----------
+    # Qwen3-Coder-30B-A3B is a Mixture-of-Experts model: 30B total params
+    # but only ~3B active per token. We still need to load all 30B into
+    # memory (the weights are the weights), but the *compute* cost is
+    # closer to a 3B dense model. This is the standout "no compromises"
+    # pick for a 24GB-class machine — flagship quality on a single box.
+    ModelEntry(
+        id="qwen3-coder:30b-a3b",
+        family="qwen3-coder",
+        kind="local",
+        params_b=30.0,
+        active_params_b=3.0,
+        context_window=262144,
+        ram_q4_gb=18.0,
+        min_ram_gb=22.0,
+        needs_dedicated_gpu="sometimes",
+        coding_score=9.6,
+        agentic_score=9.2,
+        speed_score=6.0,
+        flagship=True,
+        best_for="Flagship-class coding at a single-box memory budget. Best 'no compromises' local pick on a 24GB-class machine.",
+        watch_out="Needs ~20GB memory (works on 24GB Apple Silicon or a 24GB GPU). Slower than smaller models on weak CPUs.",
+    ),
+    # The 480B-A35B is a true server-class MoE. All 480B weights have to
+    # be loaded across the combined memory of the machine; realistically
+    # only multi-GPU rigs or huge unified-memory Mac Studios can host it.
+    ModelEntry(
+        id="qwen3-coder:480b-a35b",
+        family="qwen3-coder",
+        kind="local",
+        params_b=480.0,
+        active_params_b=35.0,
+        context_window=262144,
+        ram_q4_gb=290.0,
+        min_ram_gb=320.0,
+        needs_dedicated_gpu="yes",
+        coding_score=9.9,
+        agentic_score=9.7,
+        speed_score=2.5,
+        server_class=True,
+        best_for="The strongest open-weight coding model. Server-class only.",
+        watch_out="Requires a multi-GPU rig or a Mac Studio / Mac Pro with >200GB unified memory. Not viable on a single consumer GPU.",
+    ),
+    # DeepSeek V4 Pro — current flagship reasoning model, very strong on
+    # code. Server-class footprint.
+    ModelEntry(
+        id="deepseek-v4-pro",
+        family="deepseek",
+        kind="local",
+        params_b=620.0,
+        active_params_b=42.0,
+        context_window=200000,
+        ram_q4_gb=370.0,
+        min_ram_gb=400.0,
+        needs_dedicated_gpu="yes",
+        coding_score=9.7,
+        agentic_score=9.5,
+        speed_score=2.0,
+        server_class=True,
+        best_for="State-of-the-art open-weight reasoning, strong on code.",
+        watch_out="Server-class only. Needs a multi-GPU rig or >250GB unified memory.",
+    ),
+    # GLM-5.2 — Zhipu AI's flagship. Server-class.
+    ModelEntry(
+        id="glm-5.2",
+        family="glm",
+        kind="local",
+        params_b=520.0,
+        active_params_b=32.0,
+        context_window=200000,
+        ram_q4_gb=310.0,
+        min_ram_gb=340.0,
+        needs_dedicated_gpu="yes",
+        coding_score=9.5,
+        agentic_score=9.4,
+        speed_score=2.2,
+        server_class=True,
+        best_for="Strong Chinese-developed open-weight model with great agentic tool use.",
+        watch_out="Server-class only. Needs a multi-GPU rig or >220GB unified memory.",
+    ),
+    # Kimi K2.7 Code — Moonshot's code-specialised flagship. Server-class.
+    ModelEntry(
+        id="kimi-k2.7-code",
+        family="kimi",
+        kind="local",
+        params_b=480.0,
+        active_params_b=28.0,
+        context_window=256000,
+        ram_q4_gb=290.0,
+        min_ram_gb=320.0,
+        needs_dedicated_gpu="yes",
+        coding_score=9.6,
+        agentic_score=9.3,
+        speed_score=2.3,
+        server_class=True,
+        best_for="Code-specialised flagship; long context, strong agentic tool use.",
+        watch_out="Server-class only. Needs a multi-GPU rig or >200GB unified memory.",
+    ),
+
+    # ---------- Gemma 3 27B (Google) ----------
+    # Solid mid-tier open model, but note its license is NOT Apache/MIT —
+    # it's a custom Gemma license that has redistribution/use restrictions
+    # worth knowing about. We still recommend it because it's good, but
+    # we surface the license distinction in the catalog entry.
+    ModelEntry(
+        id="gemma3:27b",
+        family="gemma3",
+        kind="local",
+        params_b=27.0,
+        context_window=131072,
+        ram_q4_gb=17.0,
+        min_ram_gb=20.0,
+        needs_dedicated_gpu="sometimes",
+        coding_score=8.4,
+        agentic_score=8.2,
+        speed_score=5.5,
+        license="gemma (custom, not Apache/MIT)",
+        best_for="Solid mid-tier open model from Google; long context.",
+        watch_out="License is the Gemma custom license, not Apache/MIT — has redistribution/use restrictions. Needs ~20GB to load.",
+    ),
 ]
 
 
@@ -335,7 +466,7 @@ LOCAL_MODELS: list[ModelEntry] = [
 
 CLOUD_MODELS: list[ModelEntry] = [
     ModelEntry(
-        id="claude-haiku-4-5",
+        id="claude-haiku-4-5-20251001",
         family="claude",
         kind="cloud",
         params_b=None,
@@ -347,22 +478,37 @@ CLOUD_MODELS: list[ModelEntry] = [
         signup_required=True,
         best_for="Strong coding + tool use, fast, very long context.",
         watch_out="Free tier has rate limits; not always available in every region.",
-        notes="Anthropic Claude Haiku 4.5. The realistic free tier pick in the Claude family as of early 2026.",
+        notes="Anthropic Claude Haiku 4.5. The realistic free-tier pick in the Claude family.",
     ),
     ModelEntry(
-        id="claude-sonnet-4-6",
+        id="claude-sonnet-5",
         family="claude",
         kind="cloud",
         params_b=None,
         context_window=200000,
-        coding_score=9.2,
-        agentic_score=9.4,
-        speed_score=7.5,
+        coding_score=9.4,
+        agentic_score=9.5,
+        speed_score=8.0,
         free_tier=False,
         signup_required=True,
         best_for="Top-tier coding and agentic use; the model OpenCode is tuned against.",
         watch_out="Not on the free tier. Listed so the recommender can mention it as a paid upgrade path.",
-        notes="Anthropic Claude Sonnet 4.6. Stronger than Haiku but paid.",
+        notes="Anthropic Claude Sonnet 5. Stronger than Haiku but paid.",
+    ),
+    ModelEntry(
+        id="claude-opus-4-8",
+        family="claude",
+        kind="cloud",
+        params_b=None,
+        context_window=200000,
+        coding_score=9.7,
+        agentic_score=9.6,
+        speed_score=5.5,
+        free_tier=False,
+        signup_required=True,
+        best_for="The strongest Claude model; for the hardest reasoning and long-horizon agentic work.",
+        watch_out="Paid, and slow vs Sonnet/Haiku. Overkill for most coding tasks; pick Sonnet 5 for daily use.",
+        notes="Anthropic Claude Opus 4.8. Top of the Claude lineup as of 2026.",
     ),
     ModelEntry(
         id="gemini-2.0-flash",
