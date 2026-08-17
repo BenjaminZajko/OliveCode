@@ -29,7 +29,7 @@ not actually run and they'll find out the first time they try.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import MISSING, asdict, dataclass, field
 from typing import Optional
 
 
@@ -74,8 +74,8 @@ class ModelEntry:
     family: str                              # "llama", "qwen2.5-coder", "claude", "gemini", ...
     kind: str                                # "local" | "cloud"
     params_b: Optional[float]                # None for closed models we don't disclose
-    active_params_b: Optional[float] = None  # for MoE models: params active per token
     context_window: int
+    active_params_b: Optional[float] = None  # for MoE models: params active per token
     # Resource requirements (for local models)
     ram_q4_gb: Optional[float] = None        # RAM footprint at Q4_K_M
     min_ram_gb: Optional[float] = None       # absolute minimum RAM to load (incl. headroom)
@@ -110,6 +110,31 @@ class ModelEntry:
             return 0.0
         bpp = BYTES_PER_PARAM.get(self.default_quant, BYTES_PER_PARAM[DEFAULT_QUANT])
         return round(self.params_b * bpp / 8.0, 2)  # GB = bytes / 1024^3, simplified
+
+    def to_dict(self) -> dict:
+        """Plain-dict form, used by the local catalog cache."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ModelEntry":
+        """Rebuild a ModelEntry from `to_dict` output. Unknown keys are
+        ignored (so a newer cache version can't break an older codebase) and
+        missing fields fall back to their dataclass defaults — e.g. cloud
+        models routinely omit `params_b` because closed models don't disclose
+        it. Never raises on well-formed dicts; malformed values surface as
+        normal construction errors."""
+        kwargs: dict = {}
+        for name, fld in cls.__dataclass_fields__.items():  # type: ignore[attr-defined]
+            if name in d and d[name] is not None:
+                kwargs[name] = d[name]
+                continue
+            if fld.default is not MISSING:
+                kwargs[name] = fld.default
+            elif fld.default_factory is not MISSING:  # type: ignore[misc]
+                kwargs[name] = fld.default_factory()  # type: ignore[misc]
+            else:
+                kwargs[name] = None
+        return cls(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -563,11 +588,19 @@ CLOUD_MODELS: list[ModelEntry] = [
 
 class ModelCatalog:
     """Read-only view over the model lists. Lets the recommender iterate
-    and look up by id without caring about the underlying constants."""
+    and look up by id without caring about the underlying constants.
 
-    def __init__(self) -> None:
-        self.local: list[ModelEntry] = list(LOCAL_MODELS)
-        self.cloud: list[ModelEntry] = list(CLOUD_MODELS)
+    `local` / `cloud` may be passed explicitly (e.g. from a locally cached,
+    live-refreshed catalog). When omitted they default to the hardcoded
+    baseline so the advisor always has something to fall back to."""
+
+    def __init__(
+        self,
+        local: Optional[list[ModelEntry]] = None,
+        cloud: Optional[list[ModelEntry]] = None,
+    ) -> None:
+        self.local: list[ModelEntry] = list(local) if local is not None else list(LOCAL_MODELS)
+        self.cloud: list[ModelEntry] = list(cloud) if cloud is not None else list(CLOUD_MODELS)
 
     def all(self) -> list[ModelEntry]:
         return self.local + self.cloud
@@ -580,3 +613,21 @@ class ModelCatalog:
 
     def local_sorted_by_coding(self) -> list[ModelEntry]:
         return sorted(self.local, key=lambda m: m.coding_score, reverse=True)
+
+    def to_dict(self) -> dict:
+        """Serialise for the local cache: {"local": [...], "cloud": [...]}."""
+        return {
+            "local": [m.to_dict() for m in self.local],
+            "cloud": [m.to_dict() for m in self.cloud],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ModelCatalog":
+        """Rebuild a catalog from `to_dict` output. Missing/non-list sides
+        default to the hardcoded baseline so a malformed cache degrades
+        safely."""
+        raw_local = d.get("local")
+        raw_cloud = d.get("cloud")
+        local = [ModelEntry.from_dict(e) for e in raw_local] if isinstance(raw_local, list) else None
+        cloud = [ModelEntry.from_dict(e) for e in raw_cloud] if isinstance(raw_cloud, list) else None
+        return cls(local=local, cloud=cloud)

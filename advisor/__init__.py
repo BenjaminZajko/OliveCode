@@ -10,17 +10,20 @@ A modular advisor that:
      a ranked list of viable alternatives on demand.
 
 The package is intentionally split into:
-  - hardware:      detection
-  - model_catalog: the knowledge base
-  - reasoning:     scoring + recommendation logic (+ optional LLM narration)
-  - cli:           the user-facing interactive flow
-  - main:          the entry point
+  - hardware:          detection
+  - model_catalog:     the knowledge base
+  - reasoning:         scoring + recommendation logic (+ optional LLM narration)
+  - catalog_refresh:   live catalog refresh with local caching
+  - llm:               shared Anthropic API wrapper
+  - installer:         the only module allowed to shell out (Ollama pulls)
+  - cli:               the user-facing interactive flow
+  - main:              the entry point
 """
 
 from .hardware import detect_hardware, HardwareProfile
 from .model_catalog import ModelCatalog, ModelEntry
 from .reasoning import recommend, Recommendation, RankedModel
-from . import cli, main
+from . import cli, main, catalog_refresh, installer
 
 __all__ = [
     "detect_hardware",
@@ -32,4 +35,5 @@ __all__ = [
     "RankedModel",
     "cli",
     "main",
+    "installer",
 ]

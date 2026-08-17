@@ -173,6 +173,16 @@ def run_interactive(rec: Recommendation) -> int:
         return 0
 
     print()
+    # Offer to install the recommended local model. This is the "yes,
+    # set it up for me" moment that turns the advisor into a real
+    # first-run wizard.
+    if rec.primary_local is not None:
+        if _ask_yes_no(
+            f"Install {rec.primary_local.model.id} now? [Y/n] ",
+            default_yes=True,
+        ):
+            do_install(rec.primary_local.model.id, rec.profile.os_name)
+
     while True:
         ans = _safe_input(
             "Show other viable options? [y/N] (or 'q' to quit): "
@@ -188,10 +198,72 @@ def run_interactive(rec: Recommendation) -> int:
         return 0
 
 
-def print_json(rec: Recommendation) -> None:
+# ---------------------------------------------------------------------------
+# Install-prompt helpers
+# ---------------------------------------------------------------------------
+
+def _ask_yes_no(prompt: str, default_yes: bool = True) -> bool:
+    """Prompt until the user gives a recognisable yes/no answer, or until
+    stdin closes. Returns `default_yes` on EOF / empty line."""
+    suffix = "[Y/n]" if default_yes else "[y/N]"
+    while True:
+        ans = _safe_input(f"{prompt}{suffix} ").strip().lower()
+        if ans == "":
+            return default_yes
+        if ans in ("y", "yes"):
+            return True
+        if ans in ("n", "no"):
+            return False
+        # Anything else: re-prompt so we don't accidentally act on a typo.
+        print("Please answer y or n.")
+
+
+def do_install(model_id: str, os_name: Optional[str]) -> None:
+    """Run the install for `model_id`, print the result, and return."""
+    # Import inside the function so the cli module stays subprocess-free
+    # at import time. installer is the only module allowed to shell out.
+    from .installer import install_model, ollama_install_instructions
+
+    print()
+    print(f"Installing {model_id}")
+    print("-" * (len("Installing ") + len(model_id)))
+
+    result = install_model(model_id)
+    print()
+    if result.ok:
+        print(f"[install] {result.message}")
+    elif result.kind == "ollama_missing":
+        print("[install] Ollama isn't installed on this machine yet.")
+        print()
+        print(ollama_install_instructions(os_name))
+    elif result.kind == "daemon_not_running":
+        print(f"[install] {result.message}")
+        if result.detail:
+            print()
+            print(f"  (Ollama said: {result.detail})")
+    elif result.kind == "pull_cancelled":
+        print(f"[install] {result.message}")
+        print("  Run `python3 -m advisor --install` again to resume.")
+    elif result.kind == "failed":
+        print(f"[install] {result.message}")
+        if result.detail:
+            print()
+            print(f"  (Ollama said: {result.detail})")
+    else:
+        print(f"[install] {result.message}")
+    print()
+
+
+def print_json(
+    rec: Recommendation,
+    catalog_status: Optional[str] = None,
+    catalog_refreshed_at: Optional[str] = None,
+) -> None:
     """Machine-readable output for the --json flag."""
     out = {
         "hardware": rec.profile.to_dict(),
+        "catalog_status": catalog_status,
+        "catalog_refreshed_at": catalog_refreshed_at,
         "effective_memory_gb": _effective_memory_gb(rec.profile),
         "primary_local": _serialise_ranked(rec.primary_local),
         "primary_cloud": _serialise_ranked(rec.primary_cloud),
@@ -225,4 +297,4 @@ def _serialise_ranked(r: Optional[RankedModel]) -> Optional[dict]:
     }
 
 
-__all__ = ["run_interactive", "print_json", "print_hardware"]
+__all__ = ["run_interactive", "print_json", "print_hardware", "do_install"]

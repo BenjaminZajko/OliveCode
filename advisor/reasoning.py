@@ -43,12 +43,10 @@ from __future__ import annotations
 
 import json
 import math
-import os
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
 
+from . import llm
 from .hardware import HardwareProfile
 from .model_catalog import (
     BYTES_PER_PARAM,
@@ -320,8 +318,6 @@ def _score_cloud(profile: HardwareProfile, model: ModelEntry) -> RankedModel:
         reasons.append("Not on a free tier — listed as a paid upgrade path only.")
     if model.family == "claude":
         reasons.append("Claude models are particularly strong at agentic / tool-use workflows.")
-    if model.id == "claude-sonnet-4-6":
-        reasons.append("This is the strongest model OpenCode is tuned against.")
 
     # Clouds are always "comfortable" — they don't use local resources.
     # Score = quality-weighted.
@@ -414,13 +410,15 @@ def recommend(
 
     alts.sort(key=lambda r: r.score, reverse=True)
 
-    # Build the explanation
+    # Build the explanation: the LLM is the narrator when asked for (and
+    # reachable); otherwise we fall back to a short, honest, fact-specific
+    # message. Either way the local logic already made the picks.
     if use_llm:
         explanation = _maybe_llm_explain(profile, primary_local, primary_cloud, alts)
     else:
-        explanation = _templated_explain(profile, primary_local, primary_cloud, alts)
+        explanation = ""
     if not explanation:
-        explanation = _templated_explain(profile, primary_local, primary_cloud, alts)
+        explanation = _minimal_explain(profile, primary_local, primary_cloud, alts)
 
     return Recommendation(
         profile=profile,
@@ -465,50 +463,92 @@ def _profile_summary(profile: HardwareProfile, pool_gb: float) -> str:
     return " · ".join(parts) or "unknown hardware"
 
 
-def _short_reasons(r: RankedModel, limit: int = 3) -> str:
-    if not r.reasons:
-        return ""
-    return " ".join(r.reasons[:limit])
+def _fit_clause(fit: str) -> str:
+    """A short, varied clause describing how comfortably a model fits. Kept
+    as one tail of a sentence whose opening already varies by machine class,
+    so the overall message is not a single reusable template."""
+    if fit == "comfortable":
+        return "fits here with room to spare"
+    if fit == "tight":
+        return "fits, but will leave little headroom while it runs"
+    if fit == "squeezed":
+        return "will run, though it uses just about all of the available memory"
+    return "should run on almost any machine"
 
 
-def _templated_explain(
+def _minimal_explain(
     profile: HardwareProfile,
     primary_local: Optional[RankedModel],
     primary_cloud: Optional[RankedModel],
     alts: list[RankedModel],
 ) -> str:
-    """Deterministic explanation. We use this when no LLM is available."""
-    pool_gb = _effective_memory_gb(profile)
-    summary = _profile_summary(profile, pool_gb)
+    """Short, honest, fact-specific fallback used when no LLM is reachable.
 
-    lines: list[str] = []
-    lines.append(f"Detected: {summary}.")
-    if profile.notes:
-        lines.append("Notes: " + " ".join(profile.notes))
+    The opening sentence is shaped by what is actually notable about the
+    detected machine — Apple Silicon unified memory, a dedicated GPU as a
+    VRAM ceiling, a small no-GPU box, a CPU-only box, or an unknown one — so
+    it does not read as a boilerplate with numbers swapped in. Every
+    number/name comes straight from the profile.
+    """
+    pool = _effective_memory_gb(profile)
+    sentences: list[str] = []
 
-    if primary_local:
-        m = primary_local.model
-        lines.append(
-            f"Local pick: {m.id}. {_short_reasons(primary_local)}"
+    # 1. The single most defining fact about THIS machine.
+    if profile.is_apple_silicon:
+        chip = profile.cpu_model or "Apple Silicon Mac"
+        ram = f"{profile.ram_total_gb:.0f}" if profile.ram_total_gb else "?"
+        sentences.append(
+            f"Your {chip} carries {ram} GB of unified memory — macOS and the "
+            f"runtime keep a slice of it, leaving roughly {pool:.0f} GB for a "
+            f"model to actually use."
+        )
+    elif profile.best_dedicated_vram_gb > 0:
+        gpu = next((g for g in profile.gpus if g.vram_gb), None)
+        gpu_name = gpu.name if (gpu and gpu.name) else "your GPU"
+        sentences.append(
+            f"The hard ceiling here is {gpu_name}: {profile.best_dedicated_vram_gb:.0f} GB "
+            f"of VRAM for the GPU-resident layers, plus whatever spills over to "
+            f"your CPU, for about {pool:.0f} GB to work with."
+        )
+    elif profile.ram_total_gb and profile.ram_total_gb < 12:
+        sentences.append(
+            f"This box has only {profile.ram_total_gb:.0f} GB of RAM and no "
+            f"dedicated GPU, which caps a local model at roughly {pool:.0f} GB "
+            f"— big flagships are simply out of the question here."
+        )
+    elif profile.ram_total_gb:
+        sentences.append(
+            f"This is a CPU-only machine with {profile.ram_total_gb:.0f} GB of RAM, "
+            f"so a local model can draw on about {pool:.0f} GB but will run on "
+            f"the processor."
         )
     else:
-        lines.append("No local recommendation could be made.")
-
-    if primary_cloud:
-        m = primary_cloud.model
-        lines.append(
-            f"Free cloud pick: {m.id}. {_short_reasons(primary_cloud)}"
+        sentences.append(
+            "We couldn't learn much about this machine, so the picks below are "
+            "deliberately conservative."
         )
 
-    if alts:
-        next_two = alts[:2]
-        if next_two:
-            lines.append(
-                "Stronger-but-heavier local alternates: "
-                + ", ".join(f"{r.model.id} (fit: {r.fit})" for r in next_two if r.model.kind == "local")
-                + "."
+    # 2. The local pick, tied to the opening above.
+    if primary_local:
+        m = primary_local.model
+        if m.kind == "local":
+            need = _model_memory_need_gb(m)
+            sentences.append(
+                f"{m.id} is the local pick — at {m.default_quant} it needs "
+                f"~{need:.0f} GB, which {_fit_clause(primary_local.fit)}."
             )
-    return " ".join(lines)
+
+    # 3. The free cloud pick — it avoids the local memory problem entirely.
+    if primary_cloud:
+        m = primary_cloud.model
+        if m.free_tier:
+            sentences.append(
+                f"If you'd rather not spend local RAM at all, {m.id} is the "
+                f"free cloud fallback — Anthropic runs it on their own "
+                f"hardware, costing your machine nothing."
+            )
+
+    return " ".join(sentences)
 
 
 # ---------------------------------------------------------------------------
@@ -521,17 +561,16 @@ def _maybe_llm_explain(
     primary_cloud: Optional[RankedModel],
     alts: list[RankedModel],
 ) -> str:
-    """If ANTHROPIC_API_KEY is set, call Claude to write a richer narrative
+    """If ANTHROPIC_API_KEY is set, call Claude to write the natural-language
     explanation. Returns "" on any failure so the caller can fall back to
-    the templated explanation.
+    the minimal fact-specific message.
 
-    We deliberately keep the LLM's job small: it just narrates. The picks
-    are already made by the local logic; the LLM is given a compact
-    summary of those picks and asked to write a friendly paragraph or two
-    explaining them in plain English.
+    We deliberately keep the LLM's job small: it only writes the words. The
+    picks are already made by the local scoring logic; the LLM is given a
+    compact, real summary of the hardware and those picks and asked to talk
+    about this exact machine — never to second-guess the choices.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
+    if not llm.api_key():
         return ""
 
     pool_gb = _effective_memory_gb(profile)
@@ -555,6 +594,8 @@ def _maybe_llm_explain(
     payload = {
         "hardware": {
             "summary": _profile_summary(profile, pool_gb),
+            "os_name": profile.os_name,
+            "cpu_model": profile.cpu_model,
             "ram_total_gb": profile.ram_total_gb,
             "best_dedicated_vram_gb": profile.best_dedicated_vram_gb,
             "is_apple_silicon": profile.is_apple_silicon,
@@ -569,51 +610,35 @@ def _maybe_llm_explain(
 
     system_prompt = (
         "You are the explanation layer of OliveCode, a tool that recommends "
-        "AI models for a coding agent based on the user's hardware. The "
-        "recommendation engine has already chosen the picks. Your job is "
-        "to write a short, specific, friendly explanation (about 120-200 "
-        "words) of why those picks are right for THIS machine, in plain "
-        "English. Be specific to the hardware — mention concrete numbers "
-        "from the input. Do not recommend a different model; do not hedge "
-        "with 'you could also try' lists — just explain the two picks. "
-        "Never invent facts. Output plain prose, no bullet points, no JSON."
+        "AI coding models based on the user's hardware. The engine has already "
+        "chosen the picks — you only write the words. Write one short, warm "
+        "paragraph (~100-160 words) explaining why these picks suit THIS "
+        "machine.\n\n"
+        "Requirements:\n"
+        "- Reference the actual detected hardware by name and number: the exact "
+        "CPU/chip model, the exact RAM or VRAM figure, the exact model ids of "
+        "the two picks. Never write 'your device' or 'your machine' without a "
+        "concrete spec attached.\n"
+        "- Shape the message around what is genuinely notable here: e.g. unified "
+        "memory on Apple Silicon, a GPU smaller than the model, a huge memory "
+        "pool, or an old box with no GPU. Vary your sentence structure to fit "
+        "that reality; do not reuse a stock paragraph with numbers swapped in.\n"
+        "- Do not recommend different models and do not hedge with 'you could "
+        "also try' lists.\n"
+        "- Never invent facts. If a number is not in the input, do not make one up.\n"
+        "- Output plain prose only — no bullet points, no JSON, no headers."
     )
 
     user_prompt = (
-        "Here is the detected hardware and the engine's picks. Write the explanation.\n\n"
-        + json.dumps(payload, indent=2)
+        "Here is the detected hardware and the engine's picks. Write the "
+        "explanation.\n\n" + json.dumps(payload, indent=2)
     )
 
-    body = json.dumps({
-        "model": "claude-haiku-4-5",
-        "max_tokens": 600,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_prompt}],
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
+    return llm.anthropic_completion(
+        system=system_prompt,
+        user=user_prompt,
+        max_tokens=600,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, OSError):
-        return ""
-    except Exception:
-        return ""
-
-    try:
-        text_blocks = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
-        out = "\n".join(t for t in text_blocks if t).strip()
-        return out
-    except Exception:
-        return ""
 
 
 __all__ = [
